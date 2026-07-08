@@ -218,6 +218,16 @@ ok() {
   echo -e "${GREEN}$*${RESET}"
 }
 
+clear_screen() {
+  if [ -t 1 ]; then
+    if command -v clear >/dev/null 2>&1; then
+      clear
+    else
+      printf "\033[H\033[2J"
+    fi
+  fi
+}
+
 list_contains() {
   local NEEDLE="$1"
   shift
@@ -907,6 +917,8 @@ else
   RUN_CONTEXT="local"
   CONTROL_SSH_DEST=""
 fi
+
+clear_screen
 
 # ---- REQUIRE ROOT / COMMANDS ----
 if [ "$RUN_CONTEXT" = "local" ] && [ "$EUID" -ne 0 ]; then

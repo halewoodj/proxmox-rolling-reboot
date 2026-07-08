@@ -8,6 +8,7 @@ It detects cluster members with `pvecm nodes`, connects to each node over SSH, m
 
 - Detects Proxmox VE cluster nodes automatically.
 - Can run directly on a Proxmox node or remotely through a cluster control node.
+- Clears the terminal before starting the rolling reboot view.
 - Verifies SSH access to each node before processing it.
 - Reboots one node at a time.
 - Moves the control node to the end of the reboot order.
