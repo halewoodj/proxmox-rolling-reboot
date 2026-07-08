@@ -71,6 +71,8 @@ EXTRA_SSH_OPTS=()
 TUI_ENABLED=0
 TUI_DIR=""
 LOG_FILE=""
+TUI_RENDER_SUSPENDED=0
+TUI_CURSOR_HIDDEN=0
 REMOTE_CHECK_TIMEOUT=120
 MIGRATION_TIMEOUT=14400
 REBOOT_TIMEOUT=1800
@@ -227,7 +229,7 @@ emit_message() {
   fi
 
   if [ "${TUI_ENABLED:-0}" -eq 1 ]; then
-    render_tui
+    request_render
   else
     printf "%b%s%b\n" "$COLOR" "$MESSAGE" "$RESET"
   fi
@@ -241,11 +243,20 @@ log_command_output() {
     return
   fi
 
+  if [ "${TUI_ENABLED:-0}" -eq 1 ]; then
+    TUI_RENDER_SUSPENDED=1
+  fi
+
   while IFS= read -r LINE; do
     if [ -n "$LINE" ]; then
       emit_message "CMD" "$RESET" "$LINE"
     fi
   done <<< "$OUTPUT"
+
+  if [ "${TUI_ENABLED:-0}" -eq 1 ]; then
+    TUI_RENDER_SUSPENDED=0
+    request_render
+  fi
 }
 
 error_msg() {
@@ -482,7 +493,7 @@ tui_set_node() {
     printf "%s\n" "$MESSAGE"
   } > "$STATUS_FILE"
 
-  render_tui
+  request_render
 }
 
 tui_read_node_field() {
@@ -509,6 +520,62 @@ tui_read_node_field() {
   printf "%s" "$VALUE"
 }
 
+request_render() {
+  if [ "${TUI_ENABLED:-0}" -ne 1 ]; then
+    return
+  fi
+
+  if [ "${TUI_RENDER_SUSPENDED:-0}" -eq 1 ]; then
+    return
+  fi
+
+  render_tui
+}
+
+phase_color() {
+  local PHASE="$1"
+
+  case "$PHASE" in
+    Complete|Dry-run|Drained)
+      printf "%s" "$GREEN"
+      ;;
+    Failed)
+      printf "%s" "$RED"
+      ;;
+    Rebooting|Migrating|Waiting|Draining|Checking|Local\ reboot*)
+      printf "%s" "$YELLOW"
+      ;;
+    Pending)
+      printf "%s" "$CYAN"
+      ;;
+    *)
+      printf "%s" "$RESET"
+      ;;
+  esac
+}
+
+log_line_color() {
+  local LINE="$1"
+
+  case "$LINE" in
+    *"[OK]"*)
+      printf "%s" "$GREEN"
+      ;;
+    *"[WARN]"*)
+      printf "%s" "$YELLOW"
+      ;;
+    *"[ERROR]"*)
+      printf "%s" "$RED"
+      ;;
+    *"[INFO]"*)
+      printf "%s" "$CYAN"
+      ;;
+    *)
+      printf "%s" "$RESET"
+      ;;
+  esac
+}
+
 render_tui() {
   local WIDTH
   local HEIGHT
@@ -527,6 +594,9 @@ render_tui() {
   local LOG_LINES
   local TITLE="Proxmox VE Cluster Rolling Reboot"
   local CONTEXT_LABEL
+  local PHASE_COLOR
+  local LINE
+  local LINE_COLOR
 
   if [ "${TUI_ENABLED:-0}" -ne 1 ]; then
     return
@@ -572,25 +642,31 @@ render_tui() {
     CONTEXT_LABEL="local Proxmox node"
   fi
 
-  printf "\033[H\033[2J"
+  printf "\033[H"
   printf "%b%s%b\n" "$CYAN$BOLD" "$(truncate_text "$TITLE" "$WIDTH")" "$RESET"
-  printf "%s\n" "$(repeat_char "=" "$WIDTH")"
-  printf "Context: %s | Mode: %s | Ceph: %s | Progress: %s/%s\n" \
+  printf "%b%s%b\n" "$CYAN" "$(repeat_char "=" "$WIDTH")" "$RESET"
+  printf "%bContext:%b %s | %bMode:%b %s | %bCeph:%b %s | %bProgress:%b %s/%s\n" \
+    "$BOLD" "$RESET" \
     "$(truncate_text "$CONTEXT_LABEL" 24)" \
+    "$BOLD" "$RESET" \
     "$RUN_MODE" \
+    "$BOLD" "$RESET" \
     "$(truncate_text "$CEPH_MODE" 18)" \
+    "$BOLD" "$RESET" \
     "$COMPLETE_COUNT" \
     "${#ORDERED_NODES[@]}"
-  printf "Control: %s | Guests: %s\n" \
+  printf "%bControl:%b %s | %bGuests:%b %s\n" \
+    "$BOLD" "$RESET" \
     "$(truncate_text "$CONTROL_CLUSTER_NODE" 22)" \
+    "$BOLD" "$RESET" \
     "$(truncate_text "$GUEST_SCOPE" $((WIDTH - 34)))"
-  printf "%s\n" "$(repeat_char "-" "$WIDTH")"
-  printf "%-*s  %-*s  %-*s  %s\n" "$NODE_COL_WIDTH" "Node" "$PHASE_COL_WIDTH" "State" "$GUESTS_COL_WIDTH" "Guests" "Status"
-  printf "%-*s  %-*s  %-*s  %s\n" \
+  printf "%b%s%b\n" "$CYAN" "$(repeat_char "-" "$WIDTH")" "$RESET"
+  printf "%b%-*s  %-*s  %-*s  %s%b\n" "$BOLD" "$NODE_COL_WIDTH" "Node" "$PHASE_COL_WIDTH" "State" "$GUESTS_COL_WIDTH" "Guests" "Status" "$RESET"
+  printf "%b%-*s  %-*s  %-*s  %s%b\n" "$CYAN" \
     "$NODE_COL_WIDTH" "$(repeat_char "-" "$NODE_COL_WIDTH")" \
     "$PHASE_COL_WIDTH" "$(repeat_char "-" "$PHASE_COL_WIDTH")" \
     "$GUESTS_COL_WIDTH" "$(repeat_char "-" "$GUESTS_COL_WIDTH")" \
-    "$(repeat_char "-" "$MESSAGE_COL_WIDTH")"
+    "$(repeat_char "-" "$MESSAGE_COL_WIDTH")" "$RESET"
 
   for NODE in "${ORDERED_NODES[@]}"; do
     if [ "$NODE_ROWS_PRINTED" -ge "$MAX_NODE_ROWS" ]; then
@@ -601,22 +677,27 @@ render_tui() {
     PHASE=$(tui_read_node_field "$NODE" 1 "Pending")
     GUESTS=$(tui_read_node_field "$NODE" 2 "-")
     MESSAGE=$(tui_read_node_field "$NODE" 3 "Queued")
+    PHASE_COLOR=$(phase_color "$PHASE")
 
-    printf "%-*s  %-*s  %-*s  %s\n" \
+    printf "%-*s  %b%-*s%b  %-*s  %s\n" \
       "$NODE_COL_WIDTH" "$(truncate_text "$NODE" "$NODE_COL_WIDTH")" \
+      "$PHASE_COLOR" \
       "$PHASE_COL_WIDTH" "$(truncate_text "$PHASE" "$PHASE_COL_WIDTH")" \
+      "$RESET" \
       "$GUESTS_COL_WIDTH" "$(truncate_text "$GUESTS" "$GUESTS_COL_WIDTH")" \
       "$(truncate_text "$MESSAGE" "$MESSAGE_COL_WIDTH")"
     NODE_ROWS_PRINTED=$((NODE_ROWS_PRINTED + 1))
   done
 
-  printf "%s\n" "$(repeat_char "=" "$WIDTH")"
+  printf "%b%s%b\n" "$CYAN" "$(repeat_char "=" "$WIDTH")" "$RESET"
   printf "%bLogs%b\n" "$BOLD" "$RESET"
   if [ -n "${LOG_FILE:-}" ] && [ -f "$LOG_FILE" ]; then
     tail -n "$LOG_LINES" "$LOG_FILE" | while IFS= read -r LINE; do
-      printf "%s\n" "$(truncate_text "$LINE" "$WIDTH")"
+      LINE_COLOR=$(log_line_color "$LINE")
+      printf "%b%s%b\n" "$LINE_COLOR" "$(truncate_text "$LINE" "$WIDTH")" "$RESET"
     done
   fi
+  printf "\033[J"
 }
 
 init_tui() {
@@ -635,6 +716,11 @@ init_tui() {
   LOG_FILE="$TUI_DIR/run.log"
   : > "$LOG_FILE"
   TUI_ENABLED=1
+  TUI_RENDER_SUSPENDED=1
+
+  printf "\033[?25l"
+  TUI_CURSOR_HIDDEN=1
+  clear_screen
 
   for NODE in "${ORDERED_NODES[@]}"; do
     MESSAGE="Queued"
@@ -644,10 +730,16 @@ init_tui() {
     tui_set_node "$NODE" "Pending" "-" "$MESSAGE"
   done
 
-  render_tui
+  TUI_RENDER_SUSPENDED=0
+  request_render
 }
 
 cleanup_tui() {
+  if [ "${TUI_CURSOR_HIDDEN:-0}" -eq 1 ]; then
+    printf "\033[?25h"
+    TUI_CURSOR_HIDDEN=0
+  fi
+
   if [ -n "${TUI_DIR:-}" ] && [ -d "$TUI_DIR" ]; then
     rm -rf "$TUI_DIR"
   fi
