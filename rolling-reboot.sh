@@ -68,6 +68,9 @@ TARGET_STORAGE=""
 ONLY_NODES=()
 EXCLUDE_NODES=()
 EXTRA_SSH_OPTS=()
+TUI_ENABLED=0
+TUI_DIR=""
+LOG_FILE=""
 REMOTE_CHECK_TIMEOUT=120
 MIGRATION_TIMEOUT=14400
 REBOOT_TIMEOUT=1800
@@ -202,20 +205,63 @@ fi
 
 # ---- FUNCTIONS ----
 fail() {
-  echo -e "${RED}Error: $*${RESET}" >&2
+  if [ "${TUI_ENABLED:-0}" -eq 1 ]; then
+    emit_message "ERROR" "$RED" "$*"
+  else
+    echo -e "${RED}Error: $*${RESET}" >&2
+  fi
   exit 1
 }
 
+emit_message() {
+  local LEVEL="$1"
+  local COLOR="$2"
+  shift 2
+  local MESSAGE="$*"
+  local TIMESTAMP
+
+  TIMESTAMP=$(date '+%H:%M:%S')
+
+  if [ -n "${LOG_FILE:-}" ]; then
+    printf "%s [%s] %s\n" "$TIMESTAMP" "$LEVEL" "$MESSAGE" >> "$LOG_FILE"
+  fi
+
+  if [ "${TUI_ENABLED:-0}" -eq 1 ]; then
+    render_tui
+  else
+    printf "%b%s%b\n" "$COLOR" "$MESSAGE" "$RESET"
+  fi
+}
+
+log_command_output() {
+  local OUTPUT="$1"
+  local LINE
+
+  if [ -z "$OUTPUT" ]; then
+    return
+  fi
+
+  while IFS= read -r LINE; do
+    if [ -n "$LINE" ]; then
+      emit_message "CMD" "$RESET" "$LINE"
+    fi
+  done <<< "$OUTPUT"
+}
+
+error_msg() {
+  emit_message "ERROR" "$RED" "$*"
+}
+
 warn() {
-  echo -e "${YELLOW}Warning: $*${RESET}" >&2
+  emit_message "WARN" "$YELLOW" "Warning: $*"
 }
 
 info() {
-  echo -e "${CYAN}$*${RESET}"
+  emit_message "INFO" "$CYAN" "$*"
 }
 
 ok() {
-  echo -e "${GREEN}$*${RESET}"
+  emit_message "OK" "$GREEN" "$*"
 }
 
 clear_screen() {
@@ -362,6 +408,249 @@ print_meta() {
   local WIDTH="${3:-18}"
 
   printf "%b%-*s%b %s\n" "$BOLD" "$WIDTH" "$LABEL:" "$RESET" "$VALUE"
+}
+
+terminal_width() {
+  local WIDTH
+
+  WIDTH=$(tput cols 2>/dev/null || true)
+  if [[ ! "$WIDTH" =~ ^[0-9]+$ ]] || [ "$WIDTH" -lt 40 ]; then
+    WIDTH=80
+  fi
+
+  printf "%s" "$WIDTH"
+}
+
+terminal_height() {
+  local HEIGHT
+
+  HEIGHT=$(tput lines 2>/dev/null || true)
+  if [[ ! "$HEIGHT" =~ ^[0-9]+$ ]] || [ "$HEIGHT" -lt 16 ]; then
+    HEIGHT=24
+  fi
+
+  printf "%s" "$HEIGHT"
+}
+
+truncate_text() {
+  local TEXT="$1"
+  local WIDTH="$2"
+
+  if [ "$WIDTH" -le 0 ]; then
+    return
+  fi
+
+  if [ "${#TEXT}" -le "$WIDTH" ]; then
+    printf "%s" "$TEXT"
+  elif [ "$WIDTH" -eq 1 ]; then
+    printf ">"
+  else
+    printf "%s>" "${TEXT:0:$((WIDTH - 1))}"
+  fi
+}
+
+repeat_char() {
+  local CHAR="$1"
+  local COUNT="$2"
+
+  printf "%*s" "$COUNT" "" | tr ' ' "$CHAR"
+}
+
+node_status_file() {
+  local NODE="$1"
+  local SAFE_NODE
+
+  SAFE_NODE=$(printf "%s" "$NODE" | sed 's/[^A-Za-z0-9_.-]/_/g')
+  printf "%s/%s.status" "$TUI_DIR" "$SAFE_NODE"
+}
+
+tui_set_node() {
+  local NODE="$1"
+  local PHASE="$2"
+  local GUESTS="$3"
+  local MESSAGE="$4"
+  local STATUS_FILE
+
+  if [ "${TUI_ENABLED:-0}" -ne 1 ]; then
+    return
+  fi
+
+  STATUS_FILE=$(node_status_file "$NODE")
+  {
+    printf "%s\n" "$PHASE"
+    printf "%s\n" "$GUESTS"
+    printf "%s\n" "$MESSAGE"
+  } > "$STATUS_FILE"
+
+  render_tui
+}
+
+tui_read_node_field() {
+  local NODE="$1"
+  local FIELD="$2"
+  local DEFAULT="$3"
+  local STATUS_FILE
+  local VALUE
+
+  if [ "${TUI_ENABLED:-0}" -ne 1 ]; then
+    printf "%s" "$DEFAULT"
+    return
+  fi
+
+  STATUS_FILE=$(node_status_file "$NODE")
+  if [ -f "$STATUS_FILE" ]; then
+    VALUE=$(sed -n "${FIELD}p" "$STATUS_FILE")
+  fi
+
+  if [ -z "$VALUE" ]; then
+    VALUE="$DEFAULT"
+  fi
+
+  printf "%s" "$VALUE"
+}
+
+render_tui() {
+  local WIDTH
+  local HEIGHT
+  local NODE_COL_WIDTH=16
+  local PHASE_COL_WIDTH=14
+  local GUESTS_COL_WIDTH=7
+  local MESSAGE_COL_WIDTH
+  local NODE
+  local PHASE
+  local GUESTS
+  local MESSAGE
+  local COMPLETE_COUNT=0
+  local TOP_LINES
+  local MAX_NODE_ROWS
+  local NODE_ROWS_PRINTED=0
+  local LOG_LINES
+  local TITLE="Proxmox VE Cluster Rolling Reboot"
+  local CONTEXT_LABEL
+
+  if [ "${TUI_ENABLED:-0}" -ne 1 ]; then
+    return
+  fi
+
+  WIDTH=$(terminal_width)
+  HEIGHT=$(terminal_height)
+  MESSAGE_COL_WIDTH=$((WIDTH - NODE_COL_WIDTH - PHASE_COL_WIDTH - GUESTS_COL_WIDTH - 10))
+  if [ "$MESSAGE_COL_WIDTH" -lt 16 ]; then
+    MESSAGE_COL_WIDTH=16
+  fi
+
+  TOP_LINES=$((10 + ${#ORDERED_NODES[@]}))
+  if [ "$TOP_LINES" -gt $((HEIGHT - 6)) ]; then
+    TOP_LINES=$((HEIGHT - 6))
+  fi
+  if [ "$TOP_LINES" -lt 10 ]; then
+    TOP_LINES=10
+  fi
+
+  MAX_NODE_ROWS=$((TOP_LINES - 9))
+  if [ "$MAX_NODE_ROWS" -lt 1 ]; then
+    MAX_NODE_ROWS=1
+  fi
+
+  LOG_LINES=$((HEIGHT - TOP_LINES - 2))
+  if [ "$LOG_LINES" -lt 4 ]; then
+    LOG_LINES=4
+  fi
+
+  for NODE in "${ORDERED_NODES[@]}"; do
+    PHASE=$(tui_read_node_field "$NODE" 1 "Pending")
+    case "$PHASE" in
+      Complete|Dry-run|Local\ reboot\ scheduled|Failed)
+        COMPLETE_COUNT=$((COMPLETE_COUNT + 1))
+        ;;
+    esac
+  done
+
+  if [ "$RUN_CONTEXT" = "remote" ]; then
+    CONTEXT_LABEL="remote via $CONTROL_SSH_DEST"
+  else
+    CONTEXT_LABEL="local Proxmox node"
+  fi
+
+  printf "\033[H\033[2J"
+  printf "%b%s%b\n" "$CYAN$BOLD" "$(truncate_text "$TITLE" "$WIDTH")" "$RESET"
+  printf "%s\n" "$(repeat_char "=" "$WIDTH")"
+  printf "Context: %s | Mode: %s | Ceph: %s | Progress: %s/%s\n" \
+    "$(truncate_text "$CONTEXT_LABEL" 24)" \
+    "$RUN_MODE" \
+    "$(truncate_text "$CEPH_MODE" 18)" \
+    "$COMPLETE_COUNT" \
+    "${#ORDERED_NODES[@]}"
+  printf "Control: %s | Guests: %s\n" \
+    "$(truncate_text "$CONTROL_CLUSTER_NODE" 22)" \
+    "$(truncate_text "$GUEST_SCOPE" $((WIDTH - 34)))"
+  printf "%s\n" "$(repeat_char "-" "$WIDTH")"
+  printf "%-*s  %-*s  %-*s  %s\n" "$NODE_COL_WIDTH" "Node" "$PHASE_COL_WIDTH" "State" "$GUESTS_COL_WIDTH" "Guests" "Status"
+  printf "%-*s  %-*s  %-*s  %s\n" \
+    "$NODE_COL_WIDTH" "$(repeat_char "-" "$NODE_COL_WIDTH")" \
+    "$PHASE_COL_WIDTH" "$(repeat_char "-" "$PHASE_COL_WIDTH")" \
+    "$GUESTS_COL_WIDTH" "$(repeat_char "-" "$GUESTS_COL_WIDTH")" \
+    "$(repeat_char "-" "$MESSAGE_COL_WIDTH")"
+
+  for NODE in "${ORDERED_NODES[@]}"; do
+    if [ "$NODE_ROWS_PRINTED" -ge "$MAX_NODE_ROWS" ]; then
+      printf "... %s more node(s)\n" "$((${#ORDERED_NODES[@]} - NODE_ROWS_PRINTED))"
+      break
+    fi
+
+    PHASE=$(tui_read_node_field "$NODE" 1 "Pending")
+    GUESTS=$(tui_read_node_field "$NODE" 2 "-")
+    MESSAGE=$(tui_read_node_field "$NODE" 3 "Queued")
+
+    printf "%-*s  %-*s  %-*s  %s\n" \
+      "$NODE_COL_WIDTH" "$(truncate_text "$NODE" "$NODE_COL_WIDTH")" \
+      "$PHASE_COL_WIDTH" "$(truncate_text "$PHASE" "$PHASE_COL_WIDTH")" \
+      "$GUESTS_COL_WIDTH" "$(truncate_text "$GUESTS" "$GUESTS_COL_WIDTH")" \
+      "$(truncate_text "$MESSAGE" "$MESSAGE_COL_WIDTH")"
+    NODE_ROWS_PRINTED=$((NODE_ROWS_PRINTED + 1))
+  done
+
+  printf "%s\n" "$(repeat_char "=" "$WIDTH")"
+  printf "%bLogs%b\n" "$BOLD" "$RESET"
+  if [ -n "${LOG_FILE:-}" ] && [ -f "$LOG_FILE" ]; then
+    tail -n "$LOG_LINES" "$LOG_FILE" | while IFS= read -r LINE; do
+      printf "%s\n" "$(truncate_text "$LINE" "$WIDTH")"
+    done
+  fi
+}
+
+init_tui() {
+  local NODE
+  local MESSAGE
+
+  if [ ! -t 1 ]; then
+    TUI_ENABLED=0
+    return
+  fi
+
+  TUI_DIR=$(mktemp -d /tmp/proxmox-rolling-reboot.XXXXXX) || {
+    TUI_ENABLED=0
+    return
+  }
+  LOG_FILE="$TUI_DIR/run.log"
+  : > "$LOG_FILE"
+  TUI_ENABLED=1
+
+  for NODE in "${ORDERED_NODES[@]}"; do
+    MESSAGE="Queued"
+    if is_control_node "$NODE"; then
+      MESSAGE="Control node, queued last"
+    fi
+    tui_set_node "$NODE" "Pending" "-" "$MESSAGE"
+  done
+
+  render_tui
+}
+
+cleanup_tui() {
+  if [ -n "${TUI_DIR:-}" ] && [ -d "$TUI_DIR" ]; then
+    rm -rf "$TUI_DIR"
+  fi
 }
 
 now_epoch() {
@@ -536,7 +825,7 @@ wait_for_guest_to_leave_node() {
 
     NOW=$(now_epoch)
     if [ $((NOW - START)) -ge "$TIMEOUT_SECONDS" ]; then
-      echo -e "${RED}$LABEL was still listed on $NODE after waiting ${TIMEOUT_SECONDS}s.${RESET}"
+      error_msg "$LABEL was still listed on $NODE after waiting ${TIMEOUT_SECONDS}s."
       return 1
     fi
 
@@ -558,8 +847,11 @@ migrate_guest() {
   local TARGETS=()
   local TARGET
   local COMMAND
+  local MIGRATION_OUTPUT
+  local GUEST_COUNT
 
   LABEL=$(guest_label "$TYPE" "$VMID" "$STATUS")
+  GUEST_COUNT=$(tui_read_node_field "$SOURCE" 2 "-")
   while IFS= read -r TARGET; do
     if [ -n "$TARGET" ]; then
       TARGETS+=("$TARGET")
@@ -567,7 +859,7 @@ migrate_guest() {
   done < <(candidate_nodes_by_load "$SOURCE")
 
   if [ "${#TARGETS[@]}" -eq 0 ]; then
-    echo -e "${RED}No available migration target found for $LABEL on $SOURCE.${RESET}"
+    error_msg "No available migration target found for $LABEL on $SOURCE."
     return 1
   fi
 
@@ -575,18 +867,24 @@ migrate_guest() {
     COMMAND=$(build_migrate_command "$TYPE" "$VMID" "$STATUS" "$TARGET")
 
     if [ "$DRY_RUN" -eq 1 ]; then
-      echo -e "  - ${BOLD}$LABEL${RESET}: would migrate from ${BOLD}$SOURCE${RESET} to ${BOLD}$TARGET${RESET}"
+      info "$LABEL would migrate from $SOURCE to $TARGET."
       return 0
     fi
 
+    tui_set_node "$SOURCE" "Migrating" "$GUEST_COUNT" "$LABEL to $TARGET"
     info "Migrating $LABEL from $SOURCE to $TARGET..."
-    if remote_run "$SOURCE" "$MIGRATION_TIMEOUT" "$COMMAND"; then
+    MIGRATION_OUTPUT=""
+    if MIGRATION_OUTPUT=$(remote_run "$SOURCE" "$MIGRATION_TIMEOUT" "$COMMAND" 2>&1); then
+      log_command_output "$MIGRATION_OUTPUT"
       ok "Migration request for $LABEL to $TARGET completed."
+      tui_set_node "$SOURCE" "Waiting" "$GUEST_COUNT" "$LABEL leaving source"
       wait_for_guest_to_leave_node "$SOURCE" "$TYPE" "$VMID" "$LABEL" "$MIGRATION_TIMEOUT" || return 1
       ok "Migrated $LABEL to $TARGET."
       return 0
     fi
 
+    log_command_output "$MIGRATION_OUTPUT"
+    tui_set_node "$SOURCE" "Checking" "$GUEST_COUNT" "$LABEL after migration error"
     if wait_for_guest_to_leave_node "$SOURCE" "$TYPE" "$VMID" "$LABEL" 30; then
       ok "$LABEL left $SOURCE after migration command returned non-zero."
       return 0
@@ -595,7 +893,7 @@ migrate_guest() {
     warn "Migration of $LABEL to $TARGET failed; trying another target if available."
   done
 
-  echo -e "${RED}Failed to migrate $LABEL away from $SOURCE.${RESET}"
+  error_msg "Failed to migrate $LABEL away from $SOURCE."
   return 1
 }
 
@@ -630,9 +928,10 @@ evacuate_node() {
   local TYPE
   local VMID
   local STATUS
+  local TOTAL_GUESTS
 
   if ! OUTPUT=$(remaining_movable_guests "$NODE"); then
-    echo -e "${RED}Could not list guests on $NODE.${RESET}"
+    error_msg "Could not list guests on $NODE."
     return 1
   fi
 
@@ -643,22 +942,26 @@ evacuate_node() {
   done < <(printf "%s\n" "$OUTPUT" | sed '/^[[:space:]]*$/d')
 
   if [ "${#GUESTS[@]}" -eq 0 ]; then
+    tui_set_node "$NODE" "Drained" "0" "No guests need migration"
     ok "No guests need migration from $NODE."
     return 0
   fi
 
-  info "Evacuating ${#GUESTS[@]} guest(s) from $NODE..."
+  TOTAL_GUESTS=${#GUESTS[@]}
+  tui_set_node "$NODE" "Draining" "$TOTAL_GUESTS" "Evacuating guests"
+  info "Evacuating $TOTAL_GUESTS guest(s) from $NODE..."
   for ENTRY in "${GUESTS[@]}"; do
     IFS='|' read -r TYPE VMID STATUS <<< "$ENTRY"
     migrate_guest "$NODE" "$TYPE" "$VMID" "$STATUS" || return 1
   done
 
   if [ "$DRY_RUN" -eq 1 ]; then
+    tui_set_node "$NODE" "Dry-run" "$TOTAL_GUESTS" "Evacuation preview complete"
     return 0
   fi
 
   if ! OUTPUT=$(remaining_movable_guests "$NODE"); then
-    echo -e "${RED}Could not verify guest evacuation on $NODE.${RESET}"
+    error_msg "Could not verify guest evacuation on $NODE."
     return 1
   fi
 
@@ -669,14 +972,16 @@ evacuate_node() {
   done < <(printf "%s\n" "$OUTPUT" | sed '/^[[:space:]]*$/d')
 
   if [ "${#REMAINING[@]}" -gt 0 ]; then
-    echo -e "${RED}$NODE still has guest(s) after migration attempts:${RESET}"
+    tui_set_node "$NODE" "Failed" "${#REMAINING[@]}" "Guests remain after migration"
+    error_msg "$NODE still has guest(s) after migration attempts:"
     for ENTRY in "${REMAINING[@]}"; do
       IFS='|' read -r TYPE VMID STATUS <<< "$ENTRY"
-      echo "  - $(guest_label "$TYPE" "$VMID" "$STATUS")"
+      error_msg "  - $(guest_label "$TYPE" "$VMID" "$STATUS")"
     done
     return 1
   fi
 
+  tui_set_node "$NODE" "Drained" "0" "All guests evacuated"
   ok "$NODE has been evacuated."
 }
 
@@ -705,7 +1010,7 @@ wait_for_quorum() {
 
     NOW=$(now_epoch)
     if [ $((NOW - START)) -ge "$QUORUM_WAIT_TIMEOUT" ]; then
-      echo -e "${RED}Cluster quorum did not become healthy within ${QUORUM_WAIT_TIMEOUT}s ($CONTEXT).${RESET}"
+      error_msg "Cluster quorum did not become healthy within ${QUORUM_WAIT_TIMEOUT}s ($CONTEXT)."
       return 1
     fi
 
@@ -739,6 +1044,7 @@ wait_for_ceph() {
   local NOW
   local LAST_LOG=0
   local HEALTH
+  local CEPH_STATUS_OUTPUT
 
   if [ "$CEPH_REQUIRED" -eq 0 ]; then
     warn "Ceph health check skipped ($CONTEXT)."
@@ -746,7 +1052,7 @@ wait_for_ceph() {
   fi
 
   if ! cluster_run "$REMOTE_CHECK_TIMEOUT" 'command -v ceph >/dev/null 2>&1'; then
-    echo -e "${RED}Ceph command not found; refusing to continue without --skip-ceph-check.${RESET}"
+    error_msg "Ceph command not found; refusing to continue without --skip-ceph-check."
     return 1
   fi
 
@@ -760,9 +1066,10 @@ wait_for_ceph() {
 
     NOW=$(now_epoch)
     if [ $((NOW - START)) -ge "$CEPH_WAIT_TIMEOUT" ]; then
-      echo -e "${RED}Ceph did not reach HEALTH_OK within ${CEPH_WAIT_TIMEOUT}s ($CONTEXT).${RESET}"
-      echo "$HEALTH"
-      cluster_run "$REMOTE_CHECK_TIMEOUT" 'ceph status' 2>/dev/null || true
+      error_msg "Ceph did not reach HEALTH_OK within ${CEPH_WAIT_TIMEOUT}s ($CONTEXT)."
+      error_msg "$HEALTH"
+      CEPH_STATUS_OUTPUT=$(cluster_run "$REMOTE_CHECK_TIMEOUT" 'ceph status' 2>/dev/null || true)
+      log_command_output "$CEPH_STATUS_OUTPUT"
       return 1
     fi
 
@@ -823,7 +1130,7 @@ wait_for_reboot_cycle() {
 
     NOW=$(now_epoch)
     if [ $((NOW - START)) -ge "$REBOOT_TIMEOUT" ]; then
-      echo -e "${RED}$NODE did not complete a reboot cycle within ${REBOOT_TIMEOUT}s.${RESET}"
+      error_msg "$NODE did not complete a reboot cycle within ${REBOOT_TIMEOUT}s."
       return 1
     fi
 
@@ -853,7 +1160,7 @@ wait_for_node_ready() {
 
     NOW=$(now_epoch)
     if [ $((NOW - START)) -ge "$NODE_READY_TIMEOUT" ]; then
-      echo -e "${RED}$NODE Proxmox services did not become ready within ${NODE_READY_TIMEOUT}s.${RESET}"
+      error_msg "$NODE Proxmox services did not become ready within ${NODE_READY_TIMEOUT}s."
       return 1
     fi
 
@@ -897,36 +1204,43 @@ process_node() {
   local NODE="$1"
   local BOOT_ID
 
-  print_title "Rolling Reboot: $NODE"
+  tui_set_node "$NODE" "Checking" "-" "Checking quorum and Ceph"
+  info "Starting rolling reboot for $NODE."
 
-  wait_for_quorum "before processing $NODE" || return 1
-  wait_for_ceph "before processing $NODE" || return 1
+  wait_for_quorum "before processing $NODE" || { tui_set_node "$NODE" "Failed" "-" "Quorum check failed"; return 1; }
+  wait_for_ceph "before processing $NODE" || { tui_set_node "$NODE" "Failed" "-" "Ceph check failed"; return 1; }
 
   if ! ssh_available "$NODE"; then
-    echo -e "${RED}SSH to $NODE failed; refusing to process this node.${RESET}"
+    tui_set_node "$NODE" "Failed" "-" "SSH connection failed"
+    error_msg "SSH to $NODE failed; refusing to process this node."
     return 1
   fi
 
-  evacuate_node "$NODE" || return 1
+  evacuate_node "$NODE" || { tui_set_node "$NODE" "Failed" "-" "Evacuation failed"; return 1; }
 
-  wait_for_quorum "before rebooting $NODE" || return 1
-  wait_for_ceph "before rebooting $NODE" || return 1
+  tui_set_node "$NODE" "Checking" "0" "Final safety checks"
+  wait_for_quorum "before rebooting $NODE" || { tui_set_node "$NODE" "Failed" "0" "Pre-reboot quorum failed"; return 1; }
+  wait_for_ceph "before rebooting $NODE" || { tui_set_node "$NODE" "Failed" "0" "Pre-reboot Ceph failed"; return 1; }
 
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo -e "${CYAN}Dry run: would reboot ${BOLD}$NODE${RESET}${CYAN} now.${RESET}"
+    tui_set_node "$NODE" "Dry-run" "0" "Would reboot now"
+    info "Dry run: would reboot $NODE now."
     return 0
   fi
 
   if ! BOOT_ID=$(remote_boot_id "$NODE"); then
-    echo -e "${RED}Could not read boot ID from $NODE before reboot.${RESET}"
+    tui_set_node "$NODE" "Failed" "0" "Could not read boot ID"
+    error_msg "Could not read boot ID from $NODE before reboot."
     return 1
   fi
 
   if is_control_node "$NODE" && [ "$RUN_CONTEXT" = "local" ]; then
-    echo -e "${YELLOW}${BOLD}$NODE is the local control node.${RESET}"
-    echo -e "${YELLOW}It has been evacuated and passed quorum/Ceph checks. Scheduling its reboot now.${RESET}"
-    echo -e "${YELLOW}This script cannot verify the local node after SSH drops.${RESET}"
+    tui_set_node "$NODE" "Local reboot" "0" "Scheduling local reboot"
+    warn "$NODE is the local control node."
+    warn "It has been evacuated and passed quorum/Ceph checks. Scheduling its reboot now."
+    warn "This script cannot verify the local node after SSH drops."
     start_reboot "$NODE" || return 1
+    tui_set_node "$NODE" "Local reboot scheduled" "0" "Reconnect after node returns"
     return 2
   fi
 
@@ -934,12 +1248,17 @@ process_node() {
     info "$NODE is the remote control node; rebooting it last and waiting for it to return."
   fi
 
+  tui_set_node "$NODE" "Rebooting" "0" "Reboot command sent"
   info "Rebooting $NODE..."
-  start_reboot "$NODE" || return 1
-  wait_for_reboot_cycle "$NODE" "$BOOT_ID" || return 1
-  wait_for_node_ready "$NODE" || return 1
-  wait_for_quorum "after rebooting $NODE" || return 1
-  wait_for_ceph "after rebooting $NODE" || return 1
+  start_reboot "$NODE" || { tui_set_node "$NODE" "Failed" "0" "Reboot command failed"; return 1; }
+  tui_set_node "$NODE" "Waiting" "0" "Waiting for reboot"
+  wait_for_reboot_cycle "$NODE" "$BOOT_ID" || { tui_set_node "$NODE" "Failed" "0" "Reboot wait failed"; return 1; }
+  tui_set_node "$NODE" "Waiting" "0" "Waiting for Proxmox services"
+  wait_for_node_ready "$NODE" || { tui_set_node "$NODE" "Failed" "0" "Services not ready"; return 1; }
+  tui_set_node "$NODE" "Checking" "0" "Post-reboot quorum/Ceph"
+  wait_for_quorum "after rebooting $NODE" || { tui_set_node "$NODE" "Failed" "0" "Post-reboot quorum failed"; return 1; }
+  wait_for_ceph "after rebooting $NODE" || { tui_set_node "$NODE" "Failed" "0" "Post-reboot Ceph failed"; return 1; }
+  tui_set_node "$NODE" "Complete" "0" "Reboot complete"
   ok "$NODE reboot completed safely."
 }
 
@@ -1071,6 +1390,12 @@ else
   CEPH_MODE="skipped"
 fi
 
+if [ "$DRY_RUN" -eq 1 ]; then
+  RUN_MODE="dry run"
+else
+  RUN_MODE="reboot"
+fi
+
 print_title "Proxmox VE Cluster Rolling Reboot"
 if [ "$RUN_CONTEXT" = "remote" ]; then
   print_meta "Run context" "remote via $CONTROL_SSH_DEST"
@@ -1088,11 +1413,7 @@ fi
 if [ "$QM_WITH_LOCAL_DISKS" -eq 1 ]; then
   print_meta "QM local disks" "enabled"
 fi
-if [ "$DRY_RUN" -eq 1 ]; then
-  print_meta "Mode" "dry run"
-else
-  print_meta "Mode" "reboot"
-fi
+print_meta "Mode" "$RUN_MODE"
 
 if [ "$CONTROL_SELECTED" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
   warn "The control node is selected and has been moved to the end of the reboot order."
@@ -1104,20 +1425,21 @@ if [ "$CONTROL_SELECTED" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
 fi
 
 confirm_plan
+init_tui
+trap cleanup_tui EXIT
+info "Rolling reboot started."
 
 for NODE in "${ORDERED_NODES[@]}"; do
   process_node "$NODE"
   RESULT=$?
 
   if [ "$RESULT" -eq 2 ]; then
-    print_title "Local Control Node Reboot Scheduled"
-    echo -e "${GREEN}${BOLD}$NODE was evacuated and its reboot was scheduled.${RESET}"
-    echo -e "${YELLOW}Reconnect after it returns and check 'ceph health' before starting other maintenance.${RESET}"
+    ok "$NODE was evacuated and its reboot was scheduled."
+    warn "Reconnect after it returns and check 'ceph health' before starting other maintenance."
     exit 0
   elif [ "$RESULT" -ne 0 ]; then
     fail "rolling reboot stopped while processing $NODE."
   fi
 done
 
-print_title "Rolling Reboot Complete"
 ok "All selected nodes were processed."

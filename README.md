@@ -9,6 +9,7 @@ It detects cluster members with `pvecm nodes`, connects to each node over SSH, m
 - Detects Proxmox VE cluster nodes automatically.
 - Can run directly on a Proxmox node or remotely through a cluster control node.
 - Clears the terminal before starting the rolling reboot view.
+- Shows a split terminal view with node status at the top and scrolling logs at the bottom.
 - Verifies SSH access to each node before processing it.
 - Reboots one node at a time.
 - Moves the control node to the end of the reboot order.
@@ -92,6 +93,8 @@ The script asks for confirmation before starting. To run non-interactively, pass
 ```bash
 ./rolling-reboot.sh --yes
 ```
+
+After confirmation, the terminal switches to a split view. The top pane keeps a per-node summary of the current state, guest count, and latest status. The bottom pane tails timestamped logs, including Proxmox migration output.
 
 To reboot only specific nodes, use a comma-separated list:
 
