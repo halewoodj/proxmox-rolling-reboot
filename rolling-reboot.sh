@@ -576,6 +576,10 @@ log_line_color() {
   esac
 }
 
+clear_line_end() {
+  printf "\033[K"
+}
+
 render_tui() {
   local WIDTH
   local HEIGHT
@@ -643,9 +647,9 @@ render_tui() {
   fi
 
   printf "\033[H"
-  printf "%b%s%b\n" "$CYAN$BOLD" "$(truncate_text "$TITLE" "$WIDTH")" "$RESET"
-  printf "%b%s%b\n" "$CYAN" "$(repeat_char "=" "$WIDTH")" "$RESET"
-  printf "%bContext:%b %s | %bMode:%b %s | %bCeph:%b %s | %bProgress:%b %s/%s\n" \
+  printf "%b%s%b" "$CYAN$BOLD" "$(truncate_text "$TITLE" "$WIDTH")" "$RESET"; clear_line_end; printf "\n"
+  printf "%b%s%b" "$CYAN" "$(repeat_char "=" "$WIDTH")" "$RESET"; clear_line_end; printf "\n"
+  printf "%bContext:%b %s | %bMode:%b %s | %bCeph:%b %s | %bProgress:%b %s/%s" \
     "$BOLD" "$RESET" \
     "$(truncate_text "$CONTEXT_LABEL" 24)" \
     "$BOLD" "$RESET" \
@@ -655,22 +659,28 @@ render_tui() {
     "$BOLD" "$RESET" \
     "$COMPLETE_COUNT" \
     "${#ORDERED_NODES[@]}"
-  printf "%bControl:%b %s | %bGuests:%b %s\n" \
+  clear_line_end
+  printf "\n"
+  printf "%bControl:%b %s | %bGuests:%b %s" \
     "$BOLD" "$RESET" \
     "$(truncate_text "$CONTROL_CLUSTER_NODE" 22)" \
     "$BOLD" "$RESET" \
     "$(truncate_text "$GUEST_SCOPE" $((WIDTH - 34)))"
-  printf "%b%s%b\n" "$CYAN" "$(repeat_char "-" "$WIDTH")" "$RESET"
-  printf "%b%-*s  %-*s  %-*s  %s%b\n" "$BOLD" "$NODE_COL_WIDTH" "Node" "$PHASE_COL_WIDTH" "State" "$GUESTS_COL_WIDTH" "Guests" "Status" "$RESET"
-  printf "%b%-*s  %-*s  %-*s  %s%b\n" "$CYAN" \
+  clear_line_end
+  printf "\n"
+  printf "%b%s%b" "$CYAN" "$(repeat_char "-" "$WIDTH")" "$RESET"; clear_line_end; printf "\n"
+  printf "%b%-*s  %-*s  %-*s  %s%b" "$BOLD" "$NODE_COL_WIDTH" "Node" "$PHASE_COL_WIDTH" "State" "$GUESTS_COL_WIDTH" "Guests" "Status" "$RESET"; clear_line_end; printf "\n"
+  printf "%b%-*s  %-*s  %-*s  %s%b" "$CYAN" \
     "$NODE_COL_WIDTH" "$(repeat_char "-" "$NODE_COL_WIDTH")" \
     "$PHASE_COL_WIDTH" "$(repeat_char "-" "$PHASE_COL_WIDTH")" \
     "$GUESTS_COL_WIDTH" "$(repeat_char "-" "$GUESTS_COL_WIDTH")" \
     "$(repeat_char "-" "$MESSAGE_COL_WIDTH")" "$RESET"
+  clear_line_end
+  printf "\n"
 
   for NODE in "${ORDERED_NODES[@]}"; do
     if [ "$NODE_ROWS_PRINTED" -ge "$MAX_NODE_ROWS" ]; then
-      printf "... %s more node(s)\n" "$((${#ORDERED_NODES[@]} - NODE_ROWS_PRINTED))"
+      printf "... %s more node(s)" "$((${#ORDERED_NODES[@]} - NODE_ROWS_PRINTED))"; clear_line_end; printf "\n"
       break
     fi
 
@@ -679,22 +689,26 @@ render_tui() {
     MESSAGE=$(tui_read_node_field "$NODE" 3 "Queued")
     PHASE_COLOR=$(phase_color "$PHASE")
 
-    printf "%-*s  %b%-*s%b  %-*s  %s\n" \
+    printf "%-*s  %b%-*s%b  %-*s  %s" \
       "$NODE_COL_WIDTH" "$(truncate_text "$NODE" "$NODE_COL_WIDTH")" \
       "$PHASE_COLOR" \
       "$PHASE_COL_WIDTH" "$(truncate_text "$PHASE" "$PHASE_COL_WIDTH")" \
       "$RESET" \
       "$GUESTS_COL_WIDTH" "$(truncate_text "$GUESTS" "$GUESTS_COL_WIDTH")" \
       "$(truncate_text "$MESSAGE" "$MESSAGE_COL_WIDTH")"
+    clear_line_end
+    printf "\n"
     NODE_ROWS_PRINTED=$((NODE_ROWS_PRINTED + 1))
   done
 
-  printf "%b%s%b\n" "$CYAN" "$(repeat_char "=" "$WIDTH")" "$RESET"
-  printf "%bLogs%b\n" "$BOLD" "$RESET"
+  printf "%b%s%b" "$CYAN" "$(repeat_char "=" "$WIDTH")" "$RESET"; clear_line_end; printf "\n"
+  printf "%bLogs%b" "$BOLD" "$RESET"; clear_line_end; printf "\n"
   if [ -n "${LOG_FILE:-}" ] && [ -f "$LOG_FILE" ]; then
     tail -n "$LOG_LINES" "$LOG_FILE" | while IFS= read -r LINE; do
       LINE_COLOR=$(log_line_color "$LINE")
-      printf "%b%s%b\n" "$LINE_COLOR" "$(truncate_text "$LINE" "$WIDTH")" "$RESET"
+      printf "%b%s%b" "$LINE_COLOR" "$(truncate_text "$LINE" "$WIDTH")" "$RESET"
+      clear_line_end
+      printf "\n"
     done
   fi
   printf "\033[J"
