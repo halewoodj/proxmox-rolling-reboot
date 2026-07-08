@@ -517,6 +517,38 @@ guest_still_on_node() {
   return 1
 }
 
+wait_for_guest_to_leave_node() {
+  local NODE="$1"
+  local TYPE="$2"
+  local VMID="$3"
+  local LABEL="$4"
+  local TIMEOUT_SECONDS="$5"
+  local START
+  local NOW
+  local LAST_LOG=0
+
+  START=$(now_epoch)
+  while :; do
+    if ! guest_still_on_node "$NODE" "$TYPE" "$VMID"; then
+      ok "$LABEL is no longer on $NODE."
+      return 0
+    fi
+
+    NOW=$(now_epoch)
+    if [ $((NOW - START)) -ge "$TIMEOUT_SECONDS" ]; then
+      echo -e "${RED}$LABEL was still listed on $NODE after waiting ${TIMEOUT_SECONDS}s.${RESET}"
+      return 1
+    fi
+
+    if [ $((NOW - LAST_LOG)) -ge 30 ]; then
+      info "Waiting for $LABEL to leave $NODE..."
+      LAST_LOG="$NOW"
+    fi
+
+    sleep 5
+  done
+}
+
 migrate_guest() {
   local SOURCE="$1"
   local TYPE="$2"
@@ -549,12 +581,14 @@ migrate_guest() {
 
     info "Migrating $LABEL from $SOURCE to $TARGET..."
     if remote_run "$SOURCE" "$MIGRATION_TIMEOUT" "$COMMAND"; then
+      ok "Migration request for $LABEL to $TARGET completed."
+      wait_for_guest_to_leave_node "$SOURCE" "$TYPE" "$VMID" "$LABEL" "$MIGRATION_TIMEOUT" || return 1
       ok "Migrated $LABEL to $TARGET."
       return 0
     fi
 
-    if ! guest_still_on_node "$SOURCE" "$TYPE" "$VMID"; then
-      ok "$LABEL is no longer on $SOURCE after migration command returned non-zero."
+    if wait_for_guest_to_leave_node "$SOURCE" "$TYPE" "$VMID" "$LABEL" 30; then
+      ok "$LABEL left $SOURCE after migration command returned non-zero."
       return 0
     fi
 

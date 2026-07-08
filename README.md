@@ -15,6 +15,7 @@ It detects cluster members with `pvecm nodes`, connects to each node over SSH, m
 - Checks cluster quorum before processing and before rebooting each node.
 - Requires Ceph to report `HEALTH_OK` before each reboot.
 - Migrates VMs and containers away from the node being rebooted.
+- Waits for each migrated guest to disappear from the source node before moving on.
 - Supports migrating all guests or only running guests.
 - Supports selecting or excluding specific nodes.
 - Supports dry-run checks without migrating or rebooting anything.
@@ -137,6 +138,8 @@ In local mode, the script must run as root on a Proxmox node. In remote mode, th
 The Ceph gate requires `ceph health` to begin with `HEALTH_OK` before a node is rebooted and after each remote node returns. Clusters with persistent Ceph warnings will intentionally block until the warning is fixed or until you explicitly run with `--skip-ceph-check`.
 
 Migration target selection is automatic. For each guest, the script tries available cluster nodes in order of lowest current guest count and stops if the guest cannot be moved away from the node being rebooted.
+
+HA-managed guests may return from `qm migrate` or `pct migrate` after Proxmox accepts the migration request, before the guest has fully moved. The script waits for each guest to stop appearing on the source node before it proceeds to the next guest or reboot check.
 
 If the control node is selected for reboot, it is moved to the end of the order. In local mode, the script exits after scheduling that reboot because its own host is rebooting. In remote mode, the script waits for the control node to return and verifies cluster/Ceph health after it comes back.
 
