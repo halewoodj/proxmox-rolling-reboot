@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # =============================================
 # Proxmox VE Cluster Rolling Reboot Script
 # =============================================
@@ -7,9 +7,10 @@
 # - Migrates VMs/CTs away before rebooting a node
 # - Requires cluster quorum and Ceph HEALTH_OK before each reboot
 # - Waits for the node and Ceph health to recover before continuing
+# - Can run on a Proxmox node or from a workstation via --cluster-host
 #
 # Requirements:
-# - Run as root on a Proxmox VE node
+# - Run as root on a Proxmox VE node, or use --cluster-host from a workstation
 # - SSH key-based login between cluster nodes (root)
 # - Shared or otherwise migratable guest storage, unless suitable
 #   migration options are provided
@@ -30,6 +31,10 @@ Usage: $0 [options]
 Options:
   -n, --dry-run             Show what would be migrated/rebooted, but do not change anything
   -y, --yes                 Do not prompt for confirmation before starting
+      --cluster-host HOST   Run Proxmox/Ceph commands through this cluster node over SSH
+      --ssh-user USER       SSH user for hosts without an explicit user@ prefix (default: root)
+      --ssh-option OPTION   Extra local SSH -o option, may be repeated
+      --direct-node-ssh     In --cluster-host mode, connect to cluster nodes directly instead of through the cluster host
       --nodes LIST          Only reboot comma-separated node names
       --exclude LIST        Exclude comma-separated node names from reboot
       --running-only        Only migrate running guests; stopped guests may remain on the node
@@ -43,6 +48,10 @@ Options:
 
 By default the script migrates all VMs/CTs it finds on each node before rebooting
 that node. Use --running-only if your policy is to drain only active workloads.
+
+From macOS or another workstation, use --cluster-host with a Proxmox node that
+can run pvecm, ceph, qm, and pct. Other node SSH commands are relayed through
+that host by default, using the cluster's existing inter-node SSH access.
 EOF
 }
 
@@ -52,9 +61,13 @@ ASSUME_YES=0
 RUNNING_ONLY=0
 CEPH_REQUIRED=1
 QM_WITH_LOCAL_DISKS=0
+CLUSTER_HOST=""
+SSH_USER="root"
+DIRECT_NODE_SSH=0
 TARGET_STORAGE=""
 ONLY_NODES=()
 EXCLUDE_NODES=()
+EXTRA_SSH_OPTS=()
 REMOTE_CHECK_TIMEOUT=120
 MIGRATION_TIMEOUT=14400
 REBOOT_TIMEOUT=1800
@@ -78,6 +91,34 @@ while [ "$#" -gt 0 ]; do
       ;;
     -y|--yes)
       ASSUME_YES=1
+      shift
+      ;;
+    --cluster-host)
+      if [ -z "${2:-}" ]; then
+        echo -e "${RED}Error: --cluster-host requires a host name or user@host target.${RESET}"
+        exit 1
+      fi
+      CLUSTER_HOST="$2"
+      shift 2
+      ;;
+    --ssh-user)
+      if [ -z "${2:-}" ]; then
+        echo -e "${RED}Error: --ssh-user requires a user name.${RESET}"
+        exit 1
+      fi
+      SSH_USER="$2"
+      shift 2
+      ;;
+    --ssh-option)
+      if [ -z "${2:-}" ]; then
+        echo -e "${RED}Error: --ssh-option requires an OpenSSH option value, for example StrictHostKeyChecking=accept-new.${RESET}"
+        exit 1
+      fi
+      EXTRA_SSH_OPTS+=(-o "$2")
+      shift 2
+      ;;
+    --direct-node-ssh)
+      DIRECT_NODE_SSH=1
       shift
       ;;
     --nodes)
@@ -152,8 +193,10 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
-  echo -e "${RED}Error: this script requires Bash 4 or newer.${RESET}"
+if [ -z "${BASH_VERSINFO:-}" ] ||
+  [ "${BASH_VERSINFO[0]}" -lt 3 ] ||
+  { [ "${BASH_VERSINFO[0]}" -eq 3 ] && [ "${BASH_VERSINFO[1]}" -lt 2 ]; }; then
+  echo -e "${RED}Error: this script requires Bash 3.2 or newer.${RESET}"
   exit 1
 fi
 
@@ -188,13 +231,97 @@ list_contains() {
   return 1
 }
 
+ssh_destination() {
+  local HOST="$1"
+
+  if [[ "$HOST" == *@* ]]; then
+    printf "%s" "$HOST"
+  else
+    printf "%s@%s" "$SSH_USER" "$HOST"
+  fi
+}
+
+strip_ssh_user() {
+  local DEST="$1"
+
+  printf "%s" "${DEST#*@}"
+}
+
+strip_ssh_port() {
+  local HOST="$1"
+
+  printf "%s" "${HOST%%:*}"
+}
+
+node_matches_control() {
+  local NODE="$1"
+  local CONTROL_HOST_ONLY
+
+  CONTROL_HOST_ONLY=$(strip_ssh_port "$(strip_ssh_user "$CONTROL_SSH_DEST")")
+
+  [ "$NODE" = "$CONTROL_CLUSTER_NODE" ] ||
+    [ "$NODE" = "$CONTROL_SHORT_HOSTNAME" ] ||
+    [ "$NODE" = "$CONTROL_HOSTNAME" ] ||
+    [ "$NODE" = "$CONTROL_HOST_ONLY" ]
+}
+
+ssh_run() {
+  local DEST="$1"
+  shift
+
+  # shellcheck disable=SC2029 # Callers intentionally pass the remote command as SSH arguments.
+  ssh "${SSH_OPTS[@]}" "${EXTRA_SSH_OPTS[@]}" "$DEST" "$@"
+}
+
+cluster_run() {
+  local TIMEOUT_SECONDS="$1"
+  local COMMAND="$2"
+
+  if [ "$RUN_CONTEXT" = "remote" ]; then
+    # shellcheck disable=SC2029 # COMMAND is intentionally quoted locally before SSH sends it.
+    ssh_run "$CONTROL_SSH_DEST" "timeout --preserve-status ${TIMEOUT_SECONDS}s bash -lc $(printf '%q' "$COMMAND")"
+  else
+    bash -lc "$COMMAND"
+  fi
+}
+
+control_to_node_ssh_command() {
+  local NODE="$1"
+  shift
+  local DEST
+  local ARGS=()
+
+  DEST=$(ssh_destination "$NODE")
+  ARGS=(ssh "${SSH_OPTS[@]}" "$DEST" "$@")
+  shell_join "${ARGS[@]}"
+}
+
 remote_run() {
   local NODE="$1"
   local TIMEOUT_SECONDS="$2"
   local COMMAND="$3"
+  local DEST
+  local TARGET_COMMAND
+  local CONTROL_COMMAND
+
+  TARGET_COMMAND="timeout --preserve-status ${TIMEOUT_SECONDS}s bash -lc $(printf '%q' "$COMMAND")"
+
+  if [ "$RUN_CONTEXT" = "remote" ] &&
+    ! node_matches_control "$NODE" &&
+    [ "$DIRECT_NODE_SSH" -eq 0 ]; then
+    CONTROL_COMMAND=$(control_to_node_ssh_command "$NODE" "$TARGET_COMMAND")
+    cluster_run "$TIMEOUT_SECONDS" "$CONTROL_COMMAND"
+    return
+  fi
+
+  if [ "$RUN_CONTEXT" = "remote" ] && node_matches_control "$NODE"; then
+    DEST="$CONTROL_SSH_DEST"
+  else
+    DEST=$(ssh_destination "$NODE")
+  fi
 
   # shellcheck disable=SC2029 # COMMAND is intentionally quoted locally before SSH sends it.
-  ssh "${SSH_OPTS[@]}" root@"$NODE" "timeout --preserve-status ${TIMEOUT_SECONDS}s bash -lc $(printf '%q' "$COMMAND")"
+  ssh "${SSH_OPTS[@]}" "${EXTRA_SSH_OPTS[@]}" "$DEST" "$TARGET_COMMAND"
 }
 
 ssh_available() {
@@ -391,7 +518,11 @@ migrate_guest() {
   local COMMAND
 
   LABEL=$(guest_label "$TYPE" "$VMID" "$STATUS")
-  mapfile -t TARGETS < <(candidate_nodes_by_load "$SOURCE")
+  while IFS= read -r TARGET; do
+    if [ -n "$TARGET" ]; then
+      TARGETS+=("$TARGET")
+    fi
+  done < <(candidate_nodes_by_load "$SOURCE")
 
   if [ "${#TARGETS[@]}" -eq 0 ]; then
     echo -e "${RED}No available migration target found for $LABEL on $SOURCE.${RESET}"
@@ -461,7 +592,11 @@ evacuate_node() {
     return 1
   fi
 
-  mapfile -t GUESTS < <(printf "%s\n" "$OUTPUT" | sed '/^[[:space:]]*$/d')
+  while IFS= read -r ENTRY; do
+    if [ -n "$ENTRY" ]; then
+      GUESTS+=("$ENTRY")
+    fi
+  done < <(printf "%s\n" "$OUTPUT" | sed '/^[[:space:]]*$/d')
 
   if [ "${#GUESTS[@]}" -eq 0 ]; then
     ok "No guests need migration from $NODE."
@@ -483,7 +618,12 @@ evacuate_node() {
     return 1
   fi
 
-  mapfile -t REMAINING < <(printf "%s\n" "$OUTPUT" | sed '/^[[:space:]]*$/d')
+  while IFS= read -r ENTRY; do
+    if [ -n "$ENTRY" ]; then
+      REMAINING+=("$ENTRY")
+    fi
+  done < <(printf "%s\n" "$OUTPUT" | sed '/^[[:space:]]*$/d')
+
   if [ "${#REMAINING[@]}" -gt 0 ]; then
     echo -e "${RED}$NODE still has guest(s) after migration attempts:${RESET}"
     for ENTRY in "${REMAINING[@]}"; do
@@ -497,7 +637,7 @@ evacuate_node() {
 }
 
 cluster_has_quorum() {
-  pvecm status 2>/dev/null | awk -F: '
+  cluster_run "$REMOTE_CHECK_TIMEOUT" 'pvecm status' 2>/dev/null | awk -F: '
     /^[[:space:]]*Quorate:/ {
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
       if ($2 == "Yes") found=1
@@ -535,13 +675,13 @@ wait_for_quorum() {
 }
 
 ceph_health_text() {
-  ceph health 2>&1
+  cluster_run "$REMOTE_CHECK_TIMEOUT" 'ceph health' 2>&1
 }
 
 ceph_is_healthy() {
   local HEALTH
 
-  if ! command -v ceph >/dev/null 2>&1; then
+  if ! cluster_run "$REMOTE_CHECK_TIMEOUT" 'command -v ceph >/dev/null 2>&1'; then
     return 1
   fi
 
@@ -561,7 +701,7 @@ wait_for_ceph() {
     return 0
   fi
 
-  if ! command -v ceph >/dev/null 2>&1; then
+  if ! cluster_run "$REMOTE_CHECK_TIMEOUT" 'command -v ceph >/dev/null 2>&1'; then
     echo -e "${RED}Ceph command not found; refusing to continue without --skip-ceph-check.${RESET}"
     return 1
   fi
@@ -578,7 +718,7 @@ wait_for_ceph() {
     if [ $((NOW - START)) -ge "$CEPH_WAIT_TIMEOUT" ]; then
       echo -e "${RED}Ceph did not reach HEALTH_OK within ${CEPH_WAIT_TIMEOUT}s ($CONTEXT).${RESET}"
       echo "$HEALTH"
-      ceph status 2>/dev/null || true
+      cluster_run "$REMOTE_CHECK_TIMEOUT" 'ceph status' 2>/dev/null || true
       return 1
     fi
 
@@ -593,8 +733,26 @@ wait_for_ceph() {
 
 start_reboot() {
   local NODE="$1"
+  local DEST
+  local CONTROL_COMMAND
+  local REBOOT_COMMAND='nohup sh -c "sleep 2; systemctl reboot" >/dev/null 2>&1 &'
 
-  ssh "${SSH_OPTS[@]}" root@"$NODE" 'nohup sh -c "sleep 2; systemctl reboot" >/dev/null 2>&1 &' >/dev/null 2>&1
+  if [ "$RUN_CONTEXT" = "remote" ] &&
+    ! node_matches_control "$NODE" &&
+    [ "$DIRECT_NODE_SSH" -eq 0 ]; then
+    CONTROL_COMMAND=$(control_to_node_ssh_command "$NODE" "$REBOOT_COMMAND")
+    cluster_run "$REMOTE_CHECK_TIMEOUT" "$CONTROL_COMMAND" >/dev/null 2>&1
+    return
+  fi
+
+  if [ "$RUN_CONTEXT" = "remote" ] && node_matches_control "$NODE"; then
+    DEST="$CONTROL_SSH_DEST"
+  else
+    DEST=$(ssh_destination "$NODE")
+  fi
+
+  # shellcheck disable=SC2029 # REBOOT_COMMAND is intentionally sent as the remote SSH command.
+  ssh "${SSH_OPTS[@]}" "${EXTRA_SSH_OPTS[@]}" "$DEST" "$REBOOT_COMMAND" >/dev/null 2>&1
 }
 
 remote_boot_id() {
@@ -664,10 +822,10 @@ wait_for_node_ready() {
   done
 }
 
-is_local_node() {
+is_control_node() {
   local NODE="$1"
 
-  [ "$NODE" = "$LOCAL_CLUSTER_NODE" ] || [ "$NODE" = "$LOCAL_SHORT_HOSTNAME" ] || [ "$NODE" = "$LOCAL_HOSTNAME" ]
+  node_matches_control "$NODE"
 }
 
 confirm_plan() {
@@ -720,12 +878,16 @@ process_node() {
     return 1
   fi
 
-  if is_local_node "$NODE"; then
-    echo -e "${YELLOW}${BOLD}$NODE is the local node.${RESET}"
+  if is_control_node "$NODE" && [ "$RUN_CONTEXT" = "local" ]; then
+    echo -e "${YELLOW}${BOLD}$NODE is the local control node.${RESET}"
     echo -e "${YELLOW}It has been evacuated and passed quorum/Ceph checks. Scheduling its reboot now.${RESET}"
     echo -e "${YELLOW}This script cannot verify the local node after SSH drops.${RESET}"
     start_reboot "$NODE" || return 1
     return 2
+  fi
+
+  if is_control_node "$NODE" && [ "$RUN_CONTEXT" = "remote" ]; then
+    info "$NODE is the remote control node; rebooting it last and waiting for it to return."
   fi
 
   info "Rebooting $NODE..."
@@ -737,39 +899,66 @@ process_node() {
   ok "$NODE reboot completed safely."
 }
 
-# ---- REQUIRE ROOT ----
-if [ "$EUID" -ne 0 ]; then
-  fail "this script must be run as root."
+# ---- RUN CONTEXT ----
+if [ -n "$CLUSTER_HOST" ]; then
+  RUN_CONTEXT="remote"
+  CONTROL_SSH_DEST=$(ssh_destination "$CLUSTER_HOST")
+else
+  RUN_CONTEXT="local"
+  CONTROL_SSH_DEST=""
 fi
 
-# ---- REQUIRE COMMANDS ----
-for REQUIRED_CMD in pvecm ssh timeout awk sort sed date; do
+# ---- REQUIRE ROOT / COMMANDS ----
+if [ "$RUN_CONTEXT" = "local" ] && [ "$EUID" -ne 0 ]; then
+  fail "this script must be run as root when running directly on a Proxmox node. Use --cluster-host to run from a workstation."
+fi
+
+for REQUIRED_CMD in ssh awk sort sed date hostname; do
   if ! command -v "$REQUIRED_CMD" >/dev/null 2>&1; then
     fail "'$REQUIRED_CMD' command not found."
   fi
 done
 
-if [ "$CEPH_REQUIRED" -eq 1 ] && ! command -v ceph >/dev/null 2>&1; then
-  fail "'ceph' command not found. Use --skip-ceph-check only if this is not a Ceph-backed cluster."
+if [ "$RUN_CONTEXT" = "remote" ]; then
+  if ! cluster_run "$REMOTE_CHECK_TIMEOUT" 'true' >/dev/null 2>&1; then
+    fail "could not connect to cluster host '$CONTROL_SSH_DEST' over SSH."
+  fi
+fi
+
+if ! cluster_run "$REMOTE_CHECK_TIMEOUT" 'command -v pvecm >/dev/null 2>&1'; then
+  fail "'pvecm' command not found on the cluster control host."
+fi
+
+if [ "$CEPH_REQUIRED" -eq 1 ] && ! cluster_run "$REMOTE_CHECK_TIMEOUT" 'command -v ceph >/dev/null 2>&1'; then
+  fail "'ceph' command not found on the cluster control host. Use --skip-ceph-check only if this is not a Ceph-backed cluster."
 fi
 
 # ---- DETECT CLUSTER NODES ----
 info "${BOLD}Detecting Proxmox cluster nodes...${RESET}"
 
-mapfile -t DETECTED_NODES < <(
-  pvecm nodes | awk '
+PVE_NODES_OUTPUT=$(cluster_run "$REMOTE_CHECK_TIMEOUT" 'pvecm nodes') || {
+  fail "could not detect cluster nodes via 'pvecm nodes'."
+}
+
+DETECTED_NODES=()
+while IFS= read -r NODE; do
+  if [ -n "$NODE" ]; then
+    DETECTED_NODES+=("$NODE")
+  fi
+done < <(
+  printf "%s\n" "$PVE_NODES_OUTPUT" | awk '
     $1 ~ /^[0-9]+$/ && NF >= 3 {print $3}
   '
 )
 
-LOCAL_CLUSTER_NODE=$(pvecm nodes | awk '
+CONTROL_CLUSTER_NODE=$(printf "%s\n" "$PVE_NODES_OUTPUT" | awk '
   $1 ~ /^[0-9]+$/ && NF >= 4 && $NF == "(local)" {print $3; exit}
 ')
-LOCAL_SHORT_HOSTNAME=$(hostname -s 2>/dev/null || hostname)
-LOCAL_HOSTNAME=$(hostname 2>/dev/null || printf "%s" "$LOCAL_SHORT_HOSTNAME")
+CONTROL_SHORT_HOSTNAME=$(cluster_run "$REMOTE_CHECK_TIMEOUT" 'hostname -s 2>/dev/null || hostname' 2>/dev/null || true)
+CONTROL_HOSTNAME=$(cluster_run "$REMOTE_CHECK_TIMEOUT" 'hostname 2>/dev/null || hostname -s' 2>/dev/null || true)
 
-if [ -z "$LOCAL_CLUSTER_NODE" ]; then
-  LOCAL_CLUSTER_NODE="$LOCAL_SHORT_HOSTNAME"
+if [ -z "$CONTROL_CLUSTER_NODE" ]; then
+  CONTROL_CLUSTER_NODE="$CONTROL_SHORT_HOSTNAME"
 fi
 
 if [ "${#DETECTED_NODES[@]}" -eq 0 ]; then
@@ -809,19 +998,19 @@ if [ "${#SELECTED_NODES[@]}" -eq 0 ]; then
   fail "node filters matched no nodes."
 fi
 
-# Reboot the launching node last so the script can supervise every remote reboot.
+# Reboot the control node last. In local mode, the script cannot supervise its own host after reboot starts.
 ORDERED_NODES=()
-LOCAL_SELECTED=0
+CONTROL_SELECTED=0
 for NODE in "${SELECTED_NODES[@]}"; do
-  if is_local_node "$NODE"; then
-    LOCAL_SELECTED=1
+  if is_control_node "$NODE"; then
+    CONTROL_SELECTED=1
   else
     ORDERED_NODES+=("$NODE")
   fi
 done
 
-if [ "$LOCAL_SELECTED" -eq 1 ]; then
-  ORDERED_NODES+=("$LOCAL_CLUSTER_NODE")
+if [ "$CONTROL_SELECTED" -eq 1 ]; then
+  ORDERED_NODES+=("$CONTROL_CLUSTER_NODE")
 fi
 
 if [ "$RUNNING_ONLY" -eq 1 ]; then
@@ -837,9 +1026,14 @@ else
 fi
 
 print_title "Proxmox VE Cluster Rolling Reboot"
+if [ "$RUN_CONTEXT" = "remote" ]; then
+  print_meta "Run context" "remote via $CONTROL_SSH_DEST"
+else
+  print_meta "Run context" "local Proxmox node"
+fi
 print_meta "Detected nodes" "${DETECTED_NODES[*]}"
 print_meta "Selected nodes" "${ORDERED_NODES[*]}"
-print_meta "Local node" "$LOCAL_CLUSTER_NODE"
+print_meta "Control node" "$CONTROL_CLUSTER_NODE"
 print_meta "Guest scope" "$GUEST_SCOPE"
 print_meta "Ceph gate" "$CEPH_MODE"
 if [ -n "$TARGET_STORAGE" ]; then
@@ -854,9 +1048,13 @@ else
   print_meta "Mode" "reboot"
 fi
 
-if [ "$LOCAL_SELECTED" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
-  warn "The local node is selected and has been moved to the end of the reboot order."
-  warn "After the local reboot is scheduled, this script will stop because its host is rebooting."
+if [ "$CONTROL_SELECTED" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+  warn "The control node is selected and has been moved to the end of the reboot order."
+  if [ "$RUN_CONTEXT" = "local" ]; then
+    warn "After the local reboot is scheduled, this script will stop because its host is rebooting."
+  else
+    warn "Because this script is running remotely, it will wait for the control node to return."
+  fi
 fi
 
 confirm_plan
@@ -866,7 +1064,7 @@ for NODE in "${ORDERED_NODES[@]}"; do
   RESULT=$?
 
   if [ "$RESULT" -eq 2 ]; then
-    print_title "Local Reboot Scheduled"
+    print_title "Local Control Node Reboot Scheduled"
     echo -e "${GREEN}${BOLD}$NODE was evacuated and its reboot was scheduled.${RESET}"
     echo -e "${YELLOW}Reconnect after it returns and check 'ceph health' before starting other maintenance.${RESET}"
     exit 0

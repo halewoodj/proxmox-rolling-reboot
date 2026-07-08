@@ -1,15 +1,16 @@
 # Proxmox Cluster Rolling Reboot Script
 
-`rolling-reboot.sh` is a Bash helper for safely rebooting every node in a Proxmox VE cluster from a single Proxmox node.
+`rolling-reboot.sh` is a Bash helper for safely rebooting every node in a Proxmox VE cluster from a Proxmox node or from a local workstation such as macOS.
 
-It detects cluster members with `pvecm nodes`, connects to each node over SSH as `root`, migrates VMs and containers away from the node that is about to be rebooted, checks cluster quorum and Ceph health, reboots one node at a time, and waits for the cluster to recover before continuing.
+It detects cluster members with `pvecm nodes`, connects to each node over SSH, migrates VMs and containers away from the node that is about to be rebooted, checks cluster quorum and Ceph health, reboots one node at a time, and waits for the cluster to recover before continuing.
 
 ## What It Does
 
 - Detects Proxmox VE cluster nodes automatically.
+- Can run directly on a Proxmox node or remotely through a cluster control node.
 - Verifies SSH access to each node before processing it.
 - Reboots one node at a time.
-- Moves the node running the script to the end of the reboot order.
+- Moves the control node to the end of the reboot order.
 - Checks cluster quorum before processing and before rebooting each node.
 - Requires Ceph to report `HEALTH_OK` before each reboot.
 - Migrates VMs and containers away from the node being rebooted.
@@ -22,12 +23,14 @@ It detects cluster members with `pvecm nodes`, connects to each node over SSH as
 
 ## Requirements
 
-- A Proxmox VE cluster node.
-- Bash 4 or newer.
-- Root privileges.
-- `pvecm` available on the host where the script is launched.
-- `ceph` available on the host where the script is launched.
-- SSH key-based root login from the launching node to every cluster node.
+- A Proxmox VE cluster node to act as the cluster control host.
+- Bash 3.2 or newer.
+- Root privileges when running directly on a Proxmox node.
+- `pvecm` available on the cluster control host.
+- `ceph` available on the cluster control host.
+- SSH key-based login from the operator machine to the cluster control host.
+- SSH key-based login from the cluster control host to every cluster node, unless you use `--direct-node-ssh`.
+- SSH key-based login from the operator machine to every cluster node if you use `--direct-node-ssh`.
 - VM/container storage that supports migration, or explicit migration options that fit your cluster.
 
 ## Usage
@@ -54,6 +57,32 @@ Run it as root from a Proxmox VE cluster node:
 
 ```bash
 ./rolling-reboot.sh
+```
+
+Run it from macOS or another workstation by targeting a remote Proxmox control node:
+
+```bash
+./rolling-reboot.sh --cluster-host root@pve1.example.com --dry-run
+```
+
+When `--cluster-host` is set, `pvecm`, `ceph`, `qm`, and `pct` are run on Proxmox nodes over SSH. Other node commands are relayed through the cluster host by default, so your workstation only needs to reach the control node directly.
+
+If your workstation can resolve and SSH to every cluster node directly, disable the relay behavior:
+
+```bash
+./rolling-reboot.sh --cluster-host root@pve1.example.com --direct-node-ssh --dry-run
+```
+
+If your SSH user is not included in `--cluster-host`, it defaults to `root`. You can override it:
+
+```bash
+./rolling-reboot.sh --cluster-host pve1.example.com --ssh-user root --dry-run
+```
+
+To pass additional local OpenSSH options, repeat `--ssh-option`:
+
+```bash
+./rolling-reboot.sh --cluster-host root@pve1.example.com --ssh-option StrictHostKeyChecking=accept-new --dry-run
 ```
 
 The script asks for confirmation before starting. To run non-interactively, pass:
@@ -102,11 +131,13 @@ You can combine these options:
 
 The script reboots one node at a time. It does not support parallel reboots, because the goal is to keep cluster state, Ceph health, and guest placement controlled throughout the maintenance window.
 
+In local mode, the script must run as root on a Proxmox node. In remote mode, the script does not need local root privileges; it uses SSH to run privileged commands on the Proxmox control host and cluster nodes.
+
 The Ceph gate requires `ceph health` to begin with `HEALTH_OK` before a node is rebooted and after each remote node returns. Clusters with persistent Ceph warnings will intentionally block until the warning is fixed or until you explicitly run with `--skip-ceph-check`.
 
 Migration target selection is automatic. For each guest, the script tries available cluster nodes in order of lowest current guest count and stops if the guest cannot be moved away from the node being rebooted.
 
-If the node running the script is selected for reboot, it is moved to the end of the order. After it is evacuated and its reboot is scheduled, the script exits because its own host is rebooting.
+If the control node is selected for reboot, it is moved to the end of the order. In local mode, the script exits after scheduling that reboot because its own host is rebooting. In remote mode, the script waits for the control node to return and verifies cluster/Ceph health after it comes back.
 
 The script does not migrate guests back to their original nodes after the rolling reboot. It leaves guests where the successful migration commands placed them.
 
@@ -121,7 +152,7 @@ Before running this on a live cluster:
 3. Confirm Ceph reports `HEALTH_OK`.
 4. Confirm SSH root access works to all nodes.
 5. Confirm guest migration works for your storage layout.
-6. Run `./rolling-reboot.sh --dry-run`.
+6. Run `./rolling-reboot.sh --dry-run` locally, or `./rolling-reboot.sh --cluster-host root@pve1.example.com --dry-run` from a workstation.
 7. Plan a maintenance window.
 
 ## Verification
