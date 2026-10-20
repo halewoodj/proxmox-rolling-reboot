@@ -170,3 +170,50 @@ The script has been checked with:
 bash -n rolling-reboot.sh
 shellcheck rolling-reboot.sh
 ```
+
+## Semaphore
+
+Use a **Bash** task template with `semaphore/run.sh` as the entry point. The
+controller needs Bash, Python 3 and OpenSSH. Store these in a Semaphore variable
+group:
+
+| Variable | Value |
+| --- | --- |
+| `PVE_NODES_JSON` | JSON object mapping every approved cluster node name to its management IPv4 address |
+| `PVE_CLUSTER_HOST` | One node name from that inventory |
+| `PVE_KNOWN_HOSTS` | Verified Ed25519 host-key lines, indexed by those exact node names |
+| `PVE_SSH_PRIVATE_KEY` | **Secret environment variable** containing the dedicated root SSH key |
+
+Create separate templates with arguments `["preview"]` and `["apply"]`.
+Keep branch and argument overrides disabled, leave autorun disabled, and set the
+project's maximum parallel tasks to **1**. Pin each repository to a reviewed release
+tag. No recurring maintenance schedule is required.
+
+Before either mode starts, the adapter verifies SSH hostnames, exact cluster
+membership, quorum and Ceph `HEALTH_OK`. It refuses unknown/extra cluster nodes.
+The templates use the full configured inventory. A separately configured template
+can pass `--nodes pve1,pve2` to select a subset of that approved inventory.
+
+The adapter writes its SSH key into a private temporary directory, removes the key
+from subprocess environments and cleans the directory when the task finishes. It
+uses strict host-key checking, direct node connections, and a shared controller
+lock so update and reboot tasks cannot overlap on the same runner. Give this
+project only to operators authorised to maintain those hypervisors. Restrict the
+key to the Semaphore controller's source IP and disable forwarding and PTY access.
+
+The rolling reboot runs on the Semaphore controller, with the Proxmox control
+node last. **Preview** lists proposed guest migrations and reboots without doing
+either. **Apply** migrates all guests, including stopped guests, and reboots one
+node at a time. It waits for the boot ID to change, Proxmox services, quorum and
+Ceph `HEALTH_OK` before proceeding. Failed VM/container listing aborts evacuation.
+Guests stay on their migration targets after completion. Storage compatibility and
+successful migration are established by the actual migration commands; preview
+does not perform or prove a migration.
+
+Run the adapter and script failure-path checks on a Linux controller:
+
+```bash
+python3 -m unittest discover -s semaphore -p 'test_*.py' -v
+```
+
+The tests use fake SSH; they never connect to a cluster or run package maintenance.

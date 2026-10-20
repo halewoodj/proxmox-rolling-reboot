@@ -803,6 +803,7 @@ list_guests_on_node() {
   local COMMAND
 
   COMMAND="
+set -euo pipefail
 qm list 2>/dev/null | awk 'NR>1 {print \"qemu|\" \$1 \"|\" \$3}'
 pct list 2>/dev/null | awk 'NR>1 {print \"lxc|\" \$1 \"|\" \$2}'
 "
